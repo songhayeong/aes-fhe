@@ -23,12 +23,14 @@ class XORConfig:
             coeffs_path: Path = Path(__file__).with_name("xor_mono_coeffs.json"),
             nibble_hi_path: Path = Path(__file__).with_name("nibble_hi_coeffs.json"),
             nibble_lo_path: Path = Path(__file__).with_name("nibble_lo_coeffs.json"),
+            mul_coeffs_path: Path = Path(__file__).with_name("xor_256x256_coeffs.json"),
             max_level: int = 22,
             mode: str = "parallel",
             thread_count: int = 8,
             device_id: int = 0,
     ):
         self.coeffs_path = coeffs_path
+        self.mul_path = mul_coeffs_path
         self.nibble_hi_path = nibble_hi_path
         self.nibble_lo_path = nibble_lo_path
         self.max_level = max_level
@@ -56,6 +58,7 @@ class EngineWrapper:
         self.secret_key = ctx.secret_key
         self.relin_key = ctx.relinearization_key
         self.conj_key = ctx.conjugation_key
+        self.rot_key = ctx.rotation_key
 
     def encrypt(self, data: np.ndarray):
         return self.engine.encrypt(data, self.public_key)
@@ -67,6 +70,10 @@ class EngineWrapper:
         return self.engine.encode(vec)
 
     def multiply(self, a, b, relin_key=None):
+        from desilofhe import Ciphertext
+        if isinstance(a, Ciphertext) and isinstance(b, Ciphertext):
+            return self.engine.multiply(a, b, relin_key or self.relin_key)
+        # ciphertext×plaintext 또는 scalar
         if relin_key:
             return self.engine.multiply(a, b, relin_key)
         return self.engine.multiply(a, b)
@@ -95,6 +102,63 @@ class EngineWrapper:
             return self.engine.multiply(ct, val)
         pt = self.engine.encode(np.array(val, dtype=np.complex128))
         return self.engine.multiply(ct, pt)
+
+    def rotate(self, ct, steps: int):
+        """
+        Shift (slot per operation) operation
+        기본적으로 self.rotation_key 사용
+        """
+        return self.engine.rotate(ct, self.rot_key, steps)
+
+    def relinearize(self, ct, relin_key=None):
+        """
+        relinearization : 곱셈 후 차수가 높아진 암호문을 원래 차수로 되돌림.
+        기본적으로 self.relin_key 사용
+        """
+        try:
+            return self.engine.relinearize(ct, relin_key or self.relin_key)
+        except RuntimeError as e:
+            # CKKS: "should have 3 polynomials" 오류인 경우
+            # 이미 낮은 차수의 암호문이므로 그대로 반환
+            msg = str(e)
+            if "3 polynomials" in msg:
+                return ct
+            # 그 외 예외는 그대로 재던짐
+            raise
+
+    def eval_complex_poly(self,
+                          ct: Any,
+                          coeffs: Dict[int, complex]) -> Any:
+        """
+        Evaluate P(ct) = sum_{k in coeffs} coeffs[k] * ct^k
+        where coeffs[k] may be complex.
+        """
+        eng = self.engine
+        # 1) build power basis up to max degree
+        max_k = max(coeffs)
+        if max_k > 0:
+            powers = eng.make_power_basis(ct, max_k, self.relin_key)
+        else:
+            powers = []
+
+        # 2) accumulate
+        res = eng.multiply(ct, 0.0)  # zero-in-ciphertext
+        for k, c in coeffs.items():
+            # get ct^k
+            if k == 0:
+                term_ct = self.add_plain(ct, 1.0)
+            else:
+                term_ct = powers[k - 1]
+
+            # encode that complex coefficient as plaintext vector
+            vec = np.full(self.engine.slot_count, c, dtype=np.complex128)
+            pt = eng.encode(vec)
+
+            # multiply and add
+            prod = eng.multiply(term_ct, pt)
+            res = eng.add(res, prod)
+
+        return res
 
 
 class ZetaEncoder:
@@ -164,6 +228,34 @@ class CoefficientCache:
         return pt_dict
 
 
+class FullXORCache:
+    """캐시된 256×256 2D-LUT 계수 plaintext 인코딩"""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._plain_cache: Dict[int, Dict[Tuple[int, int], object]] = {}
+
+    @lru_cache(maxsize=1)
+    def load_coeffs(self) -> Dict[Tuple[int, int], complex]:
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        return {
+            (i, j): complex(r, im)
+            for i, j, r, im in data["entries"]
+        }
+
+    def get_plaintext_coeffs(self, eng: EngineWrapper) -> Dict[Tuple[int, int], object]:
+        sc = eng.engine.slot_count
+        if sc in self._plain_cache:
+            return self._plain_cache[sc]
+        coeffs = self.load_coeffs()
+        pt_dict = {}
+        for (i, j), c in coeffs.items():
+            vec = np.full(sc, c, dtype=np.complex128)
+            pt_dict[(i, j)] = eng.encode(vec)
+        self._plain_cache[sc] = pt_dict
+        return pt_dict
+
+
 class XORService:
     """
     High-level API for performing 4-bit XOR on encrypted data.
@@ -172,11 +264,13 @@ class XORService:
     def __init__(self, engine_wrapper: EngineWrapper,
                  coeff_cache: CoefficientCache,
                  nibble_hi_path: CoefficientCache,
-                 nibble_lo_path: CoefficientCache):
+                 nibble_lo_path: CoefficientCache,
+                 full_xor_cache: FullXORCache):
         self.eng_wrap = engine_wrapper
         self.coeff_cache = coeff_cache
         self.nibble_hi_cache = nibble_hi_path
         self.nibble_lo_cache = nibble_lo_path
+        self.full_xor_cache = full_xor_cache
 
     @property
     def eng(self) -> EngineWrapper:
@@ -208,6 +302,36 @@ class XORService:
             res = eng.add(res, eng.multiply(term, pt))
         return res
 
+    def xor_cipher_full(self, enc_a, enc_b):
+        eng = self.eng_wrap
+        # 0..255 거듭제곱과 conjugate 로 256 멱 기준 power basis 생성
+        pos = eng.make_power_basis(enc_a, 128)
+        basis = {0: eng.add_plain(enc_a, 1.0)}
+        # positive powers
+        for k in range(1, 129):
+            basis[k] = pos[k - 1]
+        # negative via conjugate
+        for k in range(129, 256):
+            basis[k] = eng.conjugate(pos[256 - k - 1])
+
+        pts2d = self.full_xor_cache.get_plaintext_coeffs(eng)
+
+        # 전체 이중 합으로 f(a,b)=a⊕b 평가
+        res = eng.multiply(enc_a, 0.0)
+        for (i, j), pt in pts2d.items():
+            term = eng.multiply(basis[i], basis[j], eng.relin_key)
+            res = eng.add(res, eng.multiply(term, pt))
+        return res
+
+    def xor256(self, a_int, b_int):
+        za = ZetaEncoder.to_zeta(a_int, modulus=256)
+        zb = ZetaEncoder.to_zeta(b_int, modulus=256)
+        enc_a = self.eng_wrap.encrypt(za)
+        enc_b = self.eng_wrap.encrypt(zb)
+        res_ct = self.xor_cipher_full(enc_a, enc_b)
+        dec = self.eng_wrap.decrypt(res_ct)
+        return ZetaEncoder.from_zeta(dec, modulus=256)
+
     def xor(self, a_int: np.ndarray, b_int: np.ndarray) -> np.ndarray:
         # encode
         za = ZetaEncoder.to_zeta(a_int)
@@ -220,54 +344,101 @@ class XORService:
         dec = self.eng_wrap.decrypt(res_ct)
         return ZetaEncoder.from_zeta(dec)
 
-    # def extract_nibbles(self, enc_vec) -> Tuple[object, object]:
-    #     eng = self.eng_wrap
-    #     hi_pts = self.nibble_hi_cache.get_plaintext_coeffs(eng)
-    #     lo_pts = self.nibble_lo_cache.get_plaintext_coeffs(eng)
-    #     powers = eng.make_power_basis(enc_vec, 256)
-    #     enc_hi = eng.multiply(enc_vec, 0.0)
-    #     for key, pt in hi_pts.items():
-    #         i = key if isinstance(key, int) else key[0]
-    #         term = pt if i == 0 else eng.multiply(powers[i - 1], pt)
-    #         enc_hi = eng.add(enc_hi, term)
-    #     enc_lo = eng.multiply(enc_vec, 0.0)
-    #     for key, pt in lo_pts.items():
-    #         i = key if isinstance(key, int) else key[0]
-    #         term = pt if i == 0 else eng.multiply(powers[i - 1], pt)
-    #         enc_lo = eng.add(enc_lo, term)
-    #     return enc_hi, enc_lo
-    # conjugate version으로 다시 만들어보자 !!
-    def extract_nibbles(self, enc_vec) -> Tuple[Any, Any]:
-        """
-        SIMD nibble extraction using conjugate-reduced power basis.
-        Returns (enc_hi, enc_lo) packing Zeta^(hi_nibble) and Zeta^(lo_nibble)
-        """
+        # def extract_nibbles(self, enc_vec) -> Tuple[object, object]:
+        #     eng = self.eng_wrap
+        #     hi_pts = self.nibble_hi_cache.get_plaintext_coeffs(eng)
+        #     lo_pts = self.nibble_lo_cache.get_plaintext_coeffs(eng)
+        #     powers = eng.make_power_basis(enc_vec, 256)
+        #     enc_hi = eng.multiply(enc_vec, 0.0)
+        #     for key, pt in hi_pts.items():
+        #         i = key if isinstance(key, int) else key[0]
+        #         term = pt if i == 0 else eng.multiply(powers[i - 1], pt)
+        #         enc_hi = eng.add(enc_hi, term)
+        #     enc_lo = eng.multiply(enc_vec, 0.0)
+        #     for key, pt in lo_pts.items():
+        #         i = key if isinstance(key, int) else key[0]
+        #         term = pt if i == 0 else eng.multiply(powers[i - 1], pt)
+        #         enc_lo = eng.add(enc_lo, term)
+        #     return enc_hi, enc_lo
+        # conjugate version으로 다시 만들어보자 !!
+        # def extract_nibbles(self, enc_vec) -> Tuple[Any, Any]:
+        # VERSION2
+        #     """
+        #     SIMD nibble extraction using conjugate-reduced power basis.
+        #     Returns (enc_hi, enc_lo) packing Zeta^(hi_nibble) and Zeta^(lo_nibble)
+        #     """
+        #     eng = self.eng_wrap
+        #     sc = eng.engine.slot_count
+        #     n = 256
+        #     half = n // 2
+        #
+        #     # 1) generate power-basis for exponents 1..128
+        #     pos = eng.make_power_basis(enc_vec, half)  # [ct^1, ... , ct^128]
+        #
+        #     # 2) build full dictionary of t^k for k=0...255
+        #     basis: Dict[int, Any] = {0: eng.add_plain(enc_vec, 1.0)}  # 상수항 더해주기 위함
+        #     for k in range(1, half + 1):
+        #         basis[k] = pos[k - 1]
+        #     # use conjugate to get the upper half : t^(n-k) = conj(t^k)
+        #     for k in range(half + 1, n):
+        #         # n-k in [127..1], so pos[(n-k)-1] exists
+        #         basis[k] = eng.conjugate(pos[n - k - 1])
+        #
+        #     # 3) hi-nibble LUT
+        #     hi_pts = self.nibble_hi_cache.get_plaintext_coeffs(eng)  # key are in [0...255]
+        #     enc_hi = eng.multiply(enc_vec, 0.0)
+        #     for idx, pt in hi_pts.items():
+        #         term = pt if idx == 0 else eng.multiply(basis[idx], pt)
+        #         enc_hi = eng.add(enc_hi, term)
+        #
+        #     # 4) lo-nibble LUT
+        #     lo_pts = self.nibble_lo_cache.get_plaintext_coeffs(eng)
+        #     enc_lo = eng.multiply(enc_vec, 0.0)
+        #     for idx, pt in lo_pts.items():
+        #         term = pt if idx == 0 else eng.multiply(basis[idx], pt)
+        #         enc_lo = eng.add(enc_lo, term)
+        #
+        #     return enc_hi, enc_lo
+
+    def extract_nibbles(self, enc_vec):
+        # version3
         eng = self.eng_wrap
         sc = eng.engine.slot_count
+
+        # 0) 도메인 축소
+        powers16 = eng.make_power_basis(enc_vec, 16)[15]
+        # enc_vec_16 = powers16[15]
+
         n = 256
         half = n // 2
 
-        # 1) generate power-basis for exponents 1..128
-        pos = eng.make_power_basis(enc_vec, half)  # [ct^1, ... , ct^128]
+        # 1) 필요한 idx만 뽑아내기
+        hi_pts = self.nibble_hi_cache.get_plaintext_coeffs(eng)
+        lo_pts = self.nibble_lo_cache.get_plaintext_coeffs(eng)
+        needed = set(hi_pts.keys()) | set(lo_pts.keys())
+        needed.discard(0)
 
-        # 2) build full dictionary of t^k for k=0...255
-        basis: Dict[int, Any] = {0: eng.add_plain(enc_vec, 1.0)}  # 상수항 더해주기 위함
-        for k in range(1, half + 1):
-            basis[k] = pos[k - 1]
-        # use conjugate to get the upper half : t^(n-k) = conj(t^k)
-        for k in range(half + 1, n):
-            # n-k in [127..1], so pos[(n-k)-1] exists
-            basis[k] = eng.conjugate(pos[n - k - 1])
+        # 2) power_basis는 max_idx만큼만
+        max_needed = max(needed) if needed else 1
+        # half 이상인 idx는 conjugate 로 처리하니 pos_degree = min(max_needed, half)
+        pos_degree = min(max_needed, half)
+        pos = eng.make_power_basis(enc_vec, pos_degree)
 
-        # 3) hi-nibble LUT
-        hi_pts = self.nibble_hi_cache.get_plaintext_coeffs(eng)  # key are in [0...255]
-        enc_hi = eng.multiply(enc_vec, 0.0)
+        # 3) basis 딕셔너리 (0항 + 필요한 것만)
+        basis = {0: eng.add_plain(enc_vec, 1.0)}
+        for idx in needed:
+            if idx <= pos_degree:
+                basis[idx] = pos[idx - 1]
+            else:
+                # n-idx <= half? half >= n-max_needed?
+                basis[idx] = eng.conjugate(pos[n - idx - 1])
+
+        # 4) hi/lo LUT evaluation — basis 딕셔너리만 써서 sparse loop
+        enc_hi = eng.multiply(powers16, 0.0)
         for idx, pt in hi_pts.items():
             term = pt if idx == 0 else eng.multiply(basis[idx], pt)
             enc_hi = eng.add(enc_hi, term)
 
-        # 4) lo-nibble LUT
-        lo_pts = self.nibble_lo_cache.get_plaintext_coeffs(eng)
         enc_lo = eng.multiply(enc_vec, 0.0)
         for idx, pt in lo_pts.items():
             term = pt if idx == 0 else eng.multiply(basis[idx], pt)
@@ -275,15 +446,41 @@ class XORService:
 
         return enc_hi, enc_lo
 
+    # def extract_nibbles(self, enc_vec):
+    #     """
+    #         Simplified 1D‐polynomial extraction of hi/lo nibble.
+    #         미리 로드된 256‐길이 계수 리스트를 그대로 evaluate_polynomial에 넘깁니다.
+    #     """
+    #
+    #     eng = self.eng_wrap
+    #
+    #     # 1) JSON에서 로드된 계수 dict → dense list[256]
+    #     hi_coeffs = self.nibble_hi_cache.load_coeffs()  # {idx: complex}
+    #     lo_coeffs = self.nibble_lo_cache.load_coeffs()
+    #     # n = self.nibble_hi_cache.load_coeffs().__class__ is dict and 256 or None  # 그냥 256 으로 고정
+    #
+    #     #     # 2) 0..255 모두 채우기
+    #     # hi_list = [hi_coeffs.get(k, 0 + 0j) for k in range(256)]
+    #     # lo_list = [lo_coeffs.get(k, 0 + 0j) for k in range(256)]
+    #
+    #         # 3) 직접 다항식 평가
+    #     enc_hi = eng.eval_complex_poly(enc_vec, hi_coeffs)
+    #     enc_lo = eng.eval_complex_poly(enc_vec, lo_coeffs)
+    #
+    #     return enc_hi, enc_lo
+
     def add_round_key(self, enc_state, round_key: np.ndarray) -> Any:
         eng = self.eng_wrap
         sc = eng.engine.slot_count
 
         # 1) 키를 Zeta^256로 인코딩 및 암호화
         zrk = ZetaEncoder.to_zeta(round_key, modulus=256)
+        print(zrk.size)
         if zrk.size < sc:
-            zrk = np.pad(zrk, (0, sc - zrk.size), constant_values = 1.0)
+            zrk = np.pad(zrk, (0, sc - zrk.size), constant_values=1.0)
         enc_key = eng.encrypt(zrk)
+
+        print("DEBUG: slot_count =", sc, "zrk.size =", zrk.size)
 
         # 2) 니블 분할
         sx_hi, sx_lo = self.extract_nibbles(enc_state)
@@ -293,6 +490,23 @@ class XORService:
         x_hi = self.xor_cipher(sx_hi, ky_hi)
         x_lo = self.xor_cipher(sx_lo, ky_lo)
 
+        dec_lo = eng.decrypt(x_lo)
+        vals_lo = ZetaEncoder.from_zeta(dec_lo, modulus=256)
+
+        # decrypt → zeta 복소수 벡터
+        state_z = eng.decrypt(enc_state)
+        key_z = eng.decrypt(enc_key)
+
+        # zeta → 정수 복원
+        state_vals = ZetaEncoder.from_zeta(state_z, modulus=256)
+        key_vals = ZetaEncoder.from_zeta(key_z, modulus=256)
+
+        # 이제 정수 도메인에서 %16·^ 연산 가능
+        print(
+            "DEBUG lo samples:", vals_lo[:5],
+            "expected lo:        ", (state_vals[:5] % 16) ^ (key_vals[:5] % 16)
+        )
+
         # 4) 바이트 재조합 : Zeta^256^16으로 상위 니블 스케일 + 하위 니블 곱
         # z16 = np.exp(-2j*np.pi / 256) ** 16
         # pt_z16 = eng.encode(np.full(sc, z16, dtype=np.complex128))
@@ -301,6 +515,10 @@ class XORService:
         hi16 = hi_powers[15]
         return eng.multiply(hi16, x_lo, eng.relin_key)
 
+    def add_round_key_full(self, enc_state, round_key: np.ndarray) -> Any:
+        zrk = ZetaEncoder.to_zeta(round_key, modulus=256)
+        enc_key = self.eng_wrap.encrypt(zrk)
+        return self.xor_cipher_full(enc_state, enc_key)
 
 
 def main():
@@ -309,23 +527,23 @@ def main():
     coeff_cache = CoefficientCache(config.coeffs_path)
     service = XORService(eng_wrap, coeff_cache)
 
-    np.random.seed(42)
-    a_int = np.random.randint(0, 16, size=32768, dtype=np.uint8)
-    b_int = np.random.randint(0, 16, size=32768, dtype=np.uint8)
-    expected = a_int ^ b_int
-
-    t0 = time.perf_counter()
-    result = service.xor(a_int, b_int)
-    t1 = time.perf_counter()
-
-    print(f"Elapsed: {t1 - t0:.4f}s, Match: {np.all(result == expected)}")
-
-    # AddRoundKey SIMD example
-    ct = service.eng_wrap.encrypt(ZetaEncoder.to_zeta(a_int, modulus=256))
-    ark_ct = service.add_round_key(ct, b_int[:ct.engine.slot_count])
-    dec = service.eng_wrap.decrypt(ark_ct)
-    print("AddRoundKey OK:",
-          np.all(ZetaEncoder.from_zeta(dec, modulus=256)[:a_int.size] == (a_int ^ b_int)[:a_int.size]))
+    # np.random.seed(42)
+    # a_int = np.random.randint(0, 16, size=32768, dtype=np.uint8)
+    # b_int = np.random.randint(0, 16, size=32768, dtype=np.uint8)
+    # expected = a_int ^ b_int
+    #
+    # t0 = time.perf_counter()
+    # result = service.xor(a_int, b_int)
+    # t1 = time.perf_counter()
+    #
+    # print(f"Elapsed: {t1 - t0:.4f}s, Match: {np.all(result == expected)}")
+    #
+    # # AddRoundKey SIMD example
+    # ct = service.eng_wrap.encrypt(ZetaEncoder.to_zeta(a_int, modulus=256))
+    # ark_ct = service.add_round_key(ct, b_int[:ct.engine.slot_count])
+    # dec = service.eng_wrap.decrypt(ark_ct)
+    # print("AddRoundKey OK:",
+    #       np.all(ZetaEncoder.from_zeta(dec, modulus=256)[:a_int.size] == (a_int ^ b_int)[:a_int.size]))
 
 
 if __name__ == '__main__':

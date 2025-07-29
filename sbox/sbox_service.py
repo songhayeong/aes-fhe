@@ -67,11 +67,12 @@ class SBoxService:
     """
     AES SubBytes via two 8 -> 4 LUTs sharing a single power basis.
     """
+
     def __init__(
             self,
             ctx: EngineContext,
             hi_path: Path = Path(__file__).parent / 'coeffs' / 'sbox_hi_coeffs.json',
-            lo_path : Path = Path(__file__).parent / 'coeffs' / 'sbox_lo_coeffs.json'
+            lo_path: Path = Path(__file__).parent / 'coeffs' / 'sbox_lo_coeffs.json'
     ):
         self.ctx = ctx
         self.engine = ctx.engine
@@ -88,7 +89,7 @@ class SBoxService:
 
     def _build_power_basis(self, ct: Any) -> List[Any]:
         # builds [ct^1 , ... , ct^255]
-        return self.engine.make_power_basis(ct, len(self.coeffs_hi)-1, self.rlk)
+        return self.engine.make_power_basis(ct, len(self.coeffs_hi) - 1, self.rlk)
 
     def sub_bytes(self, enc_byte: Any) -> Any:
         # Shared power basis
@@ -98,14 +99,14 @@ class SBoxService:
         for i, pt in enumerate(self.pt_hi):
             if abs(self.coeffs_hi[i]) < 1e-12:
                 continue
-            term = pt if i == 0 else self.engine.multiply(powers[i-1], pt)
+            term = pt if i == 0 else self.engine.multiply(powers[i - 1], pt)
             out_hi = self.engine.add(out_hi, term)
         # Lo nibble
         out_lo = self.engine.multiply(enc_byte, 0.0)
         for i, pt in enumerate(self.pt_lo):
             if abs(self.coeffs_lo[i]) < 1e-12:
                 continue
-            term = pt if i == 0 else self.engine.multiply(powers[i-1], pt)
+            term = pt if i == 0 else self.engine.multiply(powers[i - 1], pt)
             out_lo = self.engine.add(out_lo, term)
         # Combine hi/lo : multiply ciphertexts
         return self.engine.multiply(out_hi, out_lo, self.rlk)
@@ -122,14 +123,14 @@ class SBoxService:
         for i, pt in enumerate(self.pt_hi):
             if abs(self.coeffs_hi[i]) < 1e-12:
                 continue
-            term = pt if i == 0 else self.engine.multiply(powers[i-1], pt)
+            term = pt if i == 0 else self.engine.multiply(powers[i - 1], pt)
             out_hi = self.engine.add(out_hi, term)
         # Lo nibble
         out_lo = self.engine.multiply(enc_arr, 0.0)
         for i, pt in enumerate(self.pt_lo):
             if abs(self.coeffs_lo[i]) < 1e-12:
                 continue
-            term = pt if i == 0 else self.engine.multiply(powers[i-1], pt)
+            term = pt if i == 0 else self.engine.multiply(powers[i - 1], pt)
             out_lo = self.engine.add(out_lo, term)
         # Combine hi and lo parts
         return self.engine.multiply(out_hi, out_lo, self.rlk)
