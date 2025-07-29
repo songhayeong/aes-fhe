@@ -74,8 +74,6 @@ class EngineWrapper:
         if isinstance(a, Ciphertext) and isinstance(b, Ciphertext):
             return self.engine.multiply(a, b, relin_key or self.relin_key)
         # ciphertext×plaintext 또는 scalar
-        if relin_key:
-            return self.engine.multiply(a, b, relin_key)
         return self.engine.multiply(a, b)
 
     def add(self, a, b):
@@ -112,18 +110,15 @@ class EngineWrapper:
 
     def relinearize(self, ct, relin_key=None):
         """
-        relinearization : 곱셈 후 차수가 높아진 암호문을 원래 차수로 되돌림.
-        기본적으로 self.relin_key 사용
+        Relinearize only degree-2 ciphertexts (3 polynomials);
+        leave degree-1 ciphertexts unchanged.
         """
         try:
             return self.engine.relinearize(ct, relin_key or self.relin_key)
         except RuntimeError as e:
-            # CKKS: "should have 3 polynomials" 오류인 경우
-            # 이미 낮은 차수의 암호문이므로 그대로 반환
-            msg = str(e)
-            if "3 polynomials" in msg:
+            # if it's not a degree-2 ciphertext, skip relinearization
+            if "should have 3 polynomials" in str(e):
                 return ct
-            # 그 외 예외는 그대로 재던짐
             raise
 
     def eval_complex_poly(self,
