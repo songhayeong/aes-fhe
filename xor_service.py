@@ -24,7 +24,7 @@ class XORConfig:
             nibble_hi_path: Path = Path(__file__).parent / "nibble_hi_coeffs.json",
             nibble_lo_path: Path = Path(__file__).parent / "nibble_lo_coeffs.json",
             mul_coeffs_path: Path = Path(__file__).with_name("xor_256x256_coeffs.json"),
-            max_level: int = 30,
+            max_level: int = 33,
             mode: str = "parallel",
             thread_count: int = 8,
             device_id: int = 0,
