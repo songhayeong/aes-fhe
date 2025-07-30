@@ -51,81 +51,84 @@ out = xor_cipher(out, engine.rotate(B2p, -2))
 out = xor_cipher(out, engine.rotate(B3p, -3))
 
 """
+from typing import Any
+
 import numpy as np
 from aes_xor_fhe.xor_service import ZetaEncoder, XORService, EngineWrapper
+from aes_xor_fhe.gf_service import GFService
 
 
 class AESFHETransformer:
     """
-    CKKS SIMD 상에서 ShiftRows+MixColumns (및 역연산) 을 하나로 합친 구현.
+    CKKS SIMD 상에서 ShiftRows+MixColumns (및 역연산)을 한 번에 수행하는 구현.
     """
 
-    def __init__(self, engine_wrapper: EngineWrapper, xor_svc: XORService):
+    def __init__(
+            self,
+            engine_wrapper: EngineWrapper,
+            xor_svc: XORService,
+            gf_svc: GFService,
+    ):
         self.eng = engine_wrapper
         self.xor_svc = xor_svc
+        self.gf_svc = gf_svc
 
-        # MixColumns 상수 마스크: 슬롯 0,4,8,12 에만 값이 있음
-        mask1 = np.array([1 if i % 4 == 0 else 0 for i in range(16)], float)
-        mask2 = mask1 * 2  # X = 2
-        mask3 = mask1 * 3  # X+1 = 3
-
-        # 미리 plaintext로 인코딩해 두기
-        self.pt_C1 = self.eng.encode(ZetaEncoder.to_zeta(mask1, modulus=256))
-        self.pt_CX = self.eng.encode(ZetaEncoder.to_zeta(mask2, modulus=256))
-        self.pt_CX1 = self.eng.encode(ZetaEncoder.to_zeta(mask3, modulus=256))
-
-    # 테스트 코드 필요함
-    def merged_shift_mix(self, state_bytes: np.ndarray):
-        # 1) AES state → ζ 인코딩 → 암호화
+    def merged_shift_mix(self, state_bytes: np.ndarray) -> Any:
+        """
+        Homomorphically evaluate ShiftRows+MixColumns on a single
+        column-major 4×4 AES state (16 bytes).
+        """
+        # 1) ζ-domain 인코딩 → 암호화
         z = ZetaEncoder.to_zeta(state_bytes, modulus=256)
-        ct_A = self.eng.encrypt(z)
+        ct = self.eng.encrypt(z)
 
-        # 2) ShiftRows 에 대응하는 3가지 회전
-        ct_A1 = self.eng.rotate(ct_A, -1)
-        ct_A6 = self.eng.rotate(ct_A, -6)
-        ct_A11 = self.eng.rotate(ct_A, -11)
+        # 2) ShiftRows 대비 3가지 회전 (A1, A6, A11)
+        ctA = ct
+        ctA1 = self.eng.rotate(ctA, -1)
+        ctA6 = self.eng.rotate(ctA, -6)
+        ctA11 = self.eng.rotate(ctA, -11)
 
-        # 3) 네 블록별 MixColumns
-        # B0′ = A·C1 + A1·CX + A6·CX1
-        B0p = self.eng.add(
-            self.eng.multiply(ct_A, self.pt_C1, self.eng.relin_key),
-            self.eng.add(
-                self.eng.multiply(ct_A1, self.pt_CX, self.eng.relin_key),
-                self.eng.multiply(ct_A6, self.pt_CX1, self.eng.relin_key),
-            )
+        # 3) MixColumns: GF(2^8) 곱은 반드시 LUT(mul1, mul2, mul3)로
+        #   B0' = 1⊗A     ⊕ 2⊗A1   ⊕ 3⊗A6
+        B0 = self.xor_svc.xor_cipher(
+            self.gf_svc.mul1(ctA),
+            self.gf_svc.mul2(ctA1)
         )
-        # B1′ = (A + A1)·C1 + A6·CX1 + A11·CX
-        B1p = self.eng.add(
-            self.eng.multiply(self.eng.add(ct_A, ct_A1), self.pt_C1, self.eng.relin_key),
-            self.eng.add(
-                self.eng.multiply(ct_A6, self.pt_CX1, self.eng.relin_key),
-                self.eng.multiply(ct_A11, self.pt_CX, self.eng.relin_key),
-            )
-        )
-        # B2′ = (A + A11)·C1 + A1·CX1 + A6·CX
-        B2p = self.eng.add(
-            self.eng.multiply(self.eng.add(ct_A, ct_A11), self.pt_C1, self.eng.relin_key),
-            self.eng.add(
-                self.eng.multiply(ct_A1, self.pt_CX1, self.eng.relin_key),
-                self.eng.multiply(ct_A6, self.pt_CX, self.eng.relin_key),
-            )
-        )
-        # B3′ = A·CX1 + A1·CX + (A6 + A11)·C1
-        B3p = self.eng.add(
-            self.eng.multiply(ct_A, self.pt_CX1, self.eng.relin_key),
-            self.eng.add(
-                self.eng.multiply(ct_A1, self.pt_CX, self.eng.relin_key),
-                self.eng.multiply(self.eng.add(ct_A6, ct_A11), self.pt_C1, self.eng.relin_key),
-            )
-        )
+        B0 = self.xor_svc.xor_cipher(B0, self.gf_svc.mul3(ctA6))
 
-        # 4) 네 블록 합쳐 최종 출력 (ShiftRows 후 MixColumns 결과)
-        out = B0p
-        out = self.xor_svc.xor_cipher(out, self.eng.rotate(B1p, -1))
-        out = self.xor_svc.xor_cipher(out, self.eng.rotate(B2p, -2))
-        out = self.xor_svc.xor_cipher(out, self.eng.rotate(B3p, -3))
+        #   B1' = 1⊗(A⊕A1)  ⊕ 3⊗A6   ⊕ 2⊗A11
+        t01 = self.xor_svc.xor_cipher(ctA, ctA1)
+        B1 = self.xor_svc.xor_cipher(
+            self.gf_svc.mul1(t01),
+            self.gf_svc.mul3(ctA6)
+        )
+        B1 = self.xor_svc.xor_cipher(B1, self.gf_svc.mul2(ctA11))
+
+        #   B2' = 1⊗(A⊕A11) ⊕ 3⊗A1   ⊕ 2⊗A6
+        t011 = self.xor_svc.xor_cipher(ctA, ctA11)
+        B2 = self.xor_svc.xor_cipher(
+            self.gf_svc.mul1(t011),
+            self.gf_svc.mul3(ctA1)
+        )
+        B2 = self.xor_svc.xor_cipher(B2, self.gf_svc.mul2(ctA6))
+
+        #   B3' = 3⊗A     ⊕ 2⊗A1    ⊕ 1⊗(A6⊕A11)
+        t611 = self.xor_svc.xor_cipher(ctA6, ctA11)
+        B3 = self.xor_svc.xor_cipher(
+            self.gf_svc.mul3(ctA),
+            self.gf_svc.mul2(ctA1)
+        )
+        B3 = self.xor_svc.xor_cipher(B3, self.gf_svc.mul1(t611))
+
+        # 4) 최종 ShiftRows 합산: B0 ⊕ rot⁻¹(B1) ⊕ rot⁻²(B2) ⊕ rot⁻³(B3)
+        out = B0
+        out = self.xor_svc.xor_cipher(out, self.eng.rotate(B1, -1))
+        out = self.xor_svc.xor_cipher(out, self.eng.rotate(B2, -2))
+        out = self.xor_svc.xor_cipher(out, self.eng.rotate(B3, -3))
 
         return out
 
-    def merged_inv_mixshift(self, ct_state):
-        pass
+    def merged_inv_mixshift(self, ct_state: Any) -> Any:
+        raise NotImplementedError(
+            "InvMixShiftRows 구현 시 mul9, mul11, mul13, mul14 LUT 필요"
+        )

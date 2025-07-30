@@ -14,7 +14,7 @@ class EngineContext:
                  *,
                  max_level: int = 30,
                  mode: str = 'cpu',
-                 use_bootstrap: bool = False,
+                 use_bootstrap: bool = True,
                  use_multiparty: bool = False,
                  thread_count: int = 0,
                  device_id: int = 0,
@@ -43,7 +43,7 @@ class EngineContext:
                 mode=mode,
                 use_multiparty=use_multiparty,
                 thread_count=thread_count,
-                device_id=device_id
+                device_id=device_id,
             )
         elif signature == 3:
             self.engine = Engine(

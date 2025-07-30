@@ -44,6 +44,13 @@ def compute_2d_lut_coeffs(output_func, n: int = 16) -> np.ndarray:
     return np.fft.ifft2(lut2d)
 
 
+def compute_1d_lut_coeffs1(output_func, n):
+    ζ = np.exp(-2j*np.pi/n)
+    lut = np.array([ζ**output_func(x) for x in range(n)])
+    coeffs = np.fft.ifft(lut)
+    # (여기에 대칭성 보장 로직 넣어도 되고)
+    return coeffs
+
 def save_1d_coeffs(coeffs: np.ndarray, path: Path, tol: float = 1e-12):
     """
     Save unique 1D coefficients up to n/2 due to symmetry.
@@ -83,15 +90,22 @@ def save_2d_coeffs(coeffs: np.ndarray, path: Path, tol: float = 1e-12):
 def main():
     base = Path(__file__).resolve().parent / "coeffs"
     # 1D nibble LUTs (256→16)
-    hi = compute_1d_lut_coeffs(lambda x: x // 16)
-    save_1d_coeffs(hi, base / "nibble_hi_coeffs.json")
+    # hi = compute_1d_lut_coeffs(lambda x: x // 16,n=256)
+    # save_1d_coeffs(hi, base / "nibble_hi_coeffs.json")
+    #
+    # lo16 = compute_1d_lut_coeffs1(lambda x: x%16, n=16)
+    # save_1d_coeffs(lo16, base/ "nibble_test.json")
+    #
+    # lo = compute_1d_lut_coeffs(lambda x: x % 16, n=16, use_symmetry=False)
+    # save_1d_coeffs(lo, base / "nibble_lo_coeffs.json")
+    #
+    # # 2D XOR LUT (16×16)
+    # xor2d = compute_2d_lut_coeffs(lambda i, j: i ^ j)
+    # save_2d_coeffs(xor2d, base / "xor_mono_coeffs.json")
 
-    lo = compute_1d_lut_coeffs(lambda x: x % 16)
-    save_1d_coeffs(lo, base / "nibble_lo_coeffs.json")
+    lo16 = compute_1d_lut_coeffs1(lambda x: x%16, n=16)
+    save_1d_coeffs(lo16, base/ "nibble_test.json")
 
-    # 2D XOR LUT (16×16)
-    xor2d = compute_2d_lut_coeffs(lambda i, j: i ^ j)
-    save_2d_coeffs(xor2d, base / "xor_mono_coeffs.json")
 
     print("Generated nibble_hi, nibble_lo (1D) and xor_mono (2D) coeffs")
 

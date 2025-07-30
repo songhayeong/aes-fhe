@@ -5,16 +5,20 @@ from aes_xor_fhe.xor_service import XORService, EngineWrapper, XORConfig, Coeffi
 from aes_xor_fhe.engine_context import EngineContext
 
 # Paths to coefficient JSON files
-ROOT = Path(__file__).resolve().parent.parent / "aes_xor_fhe"
+ROOT = Path(__file__).resolve().parent.parent
 XOR_COEFF_PATH = ROOT / "xor_mono_coeffs.json"
-NIBBLE_HI_PATH = ROOT / "generator" / "coeffs" / "nibble_hi_coeffs.json"
-NIBBLE_LO_PATH = ROOT / "generator" / "coeffs" / "nibble_lo_coeffs.json"
+NIBBLE_HI_PATH = ROOT / "nibble_hi_coeffs.json"
+NIBBLE_LO_PATH = ROOT / "nibble_test.json"
 XOR_FULL_PATH = ROOT /  "xor_256x256_coeffs.json"
 
 
 @pytest.fixture(scope="module")
 def xor_svc():
-    cfg = XORConfig()
+    cfg = XORConfig(
+        coeffs_path=XOR_COEFF_PATH,
+        nibble_hi_path=NIBBLE_HI_PATH,
+        nibble_lo_path=NIBBLE_LO_PATH,
+    )
     eng = EngineWrapper(cfg)
     coeff_cache = CoefficientCache(cfg.coeffs_path)
     hi_cache = CoefficientCache(cfg.nibble_hi_path)
@@ -48,9 +52,9 @@ def test_add_round_key_simd(xor_svc):
 
     # Encode state as full-slot zeta vector
     ze = ZetaEncoder.to_zeta(state, modulus=256)
-    sc = xor_svc.eng.engine.slot_count
-    if ze.size < sc:
-        ze = np.pad(ze, (0, sc - ze.size), constant_values=1.0)
+    # sc = xor_svc.eng.engine.slot_count
+    # if ze.size < sc:
+    #     ze = np.pad(ze, (0, sc - ze.size), constant_values=1.0)
     enc_state = xor_svc.eng.encrypt(ze)
 
     # Perform AddRoundKey
@@ -97,3 +101,36 @@ def test_simple_test(xor_svc):
     enc_state = xor_svc.eng.encrypt(ze)
 
     ark = xor_svc.add_round_key()
+
+
+def test_nibble_xor_bruteforce(xor_svc):
+    eng = xor_svc.eng    # EngineWrapper
+    xor_cipher = xor_svc.xor_cipher
+    for i in range(16):
+        for j in range(16):
+            # 1) 4비트 값을 ζ₁₆ 도메인으로 인코딩
+            zi = ZetaEncoder.to_zeta(np.array([i], dtype=np.uint8), modulus=16)
+            zj = ZetaEncoder.to_zeta(np.array([j], dtype=np.uint8), modulus=16)
+            # 2) 암호화
+            cti = eng.encrypt(zi)
+            ctj = eng.encrypt(zj)
+            # 3) 동형평면에서 4bit XOR 수행
+            ct_out = xor_cipher(cti, ctj)
+            # 4) 복호화·디코딩
+            raw = eng.decrypt(ct_out)
+            out = ZetaEncoder.from_zeta(raw, modulus=16)[0]
+            # 5) 결과 검증
+            assert out == (i ^ j), f"{i} ^ {j} → got {out}"
+
+
+def test_extract_nibbles(xor_svc):
+    rng = np.random.default_rng(0)
+    vals = rng.integers(0, 256, size=16, dtype=np.uint8)
+    enc = xor_svc.eng.encrypt(ZetaEncoder.to_zeta(vals, modulus=256))
+    hi_ct, lo_ct = xor_svc.extract_nibbles(enc)
+
+    hi = ZetaEncoder.from_zeta(xor_svc.eng.decrypt(hi_ct), modulus=16)
+    lo = ZetaEncoder.from_zeta(xor_svc.eng.decrypt(lo_ct), modulus=16)
+
+    assert np.array_equal(hi, vals // 16)
+    assert np.array_equal(lo, vals % 16)

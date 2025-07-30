@@ -20,6 +20,7 @@ def engine_wrap():
 
 def test_encrypt_decrypt_identity(engine_wrap):
     # 랜덤 실수 벡터 암호화→복호화 시 원본과 거의 동일해야 함
+
     sc = engine_wrap.engine.slot_count
     vec = np.linspace(0.0, 1.0, num=sc, dtype=np.float64)
     ct = engine_wrap.encrypt(vec)
