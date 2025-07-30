@@ -86,10 +86,12 @@ class SBoxService:
                       for c in self.coeffs_hi]
         self.pt_lo = [self.engine.encode(np.full(sc, c, dtype=np.complex128))
                       for c in self.coeffs_lo]
+        # 계수 저장 하고
 
     def _build_power_basis(self, ct: Any) -> List[Any]:
         # builds [ct^1 , ... , ct^255]
         return self.engine.make_power_basis(ct, len(self.coeffs_hi) - 1, self.rlk)
+    # 계수 뽑는 함수 만들어 냈고
 
     def sub_bytes(self, enc_byte: Any) -> Any:
         # Shared power basis
@@ -98,7 +100,7 @@ class SBoxService:
         out_hi = self.engine.multiply(enc_byte, 0.0)
         for i, pt in enumerate(self.pt_hi):
             if abs(self.coeffs_hi[i]) < 1e-12:
-                continue
+                continue # 0에 가까운 애들은 pass -> sparsity ! paper에서는 ..?
             term = pt if i == 0 else self.engine.multiply(powers[i - 1], pt)
             out_hi = self.engine.add(out_hi, term)
         # Lo nibble

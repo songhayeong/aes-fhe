@@ -2,6 +2,7 @@ from typing import Any
 import numpy as np
 from aes_xor_fhe.xor_service import ZetaEncoder, XORService, EngineWrapper
 from aes_xor_fhe.gf_service import GFService
+from aes_xor_fhe.new import decrypt_and_recombine
 
 
 class AESFHETransformer:
@@ -35,19 +36,20 @@ class AESFHETransformer:
 
         # 3) "한 블록(Bi')"에 대응하는 MixColumns 계산 헬퍼
         # galois field에 대한 3,2,1 연산
-        def apply_mix(spec: list[tuple[str, str]]) -> Any:
-            """
-            spec: [('A', 'mul1'), ('A1', 'mul2'), ('A6', 'mul3')] 같은 형태.
-            mul1은 identity, mul2는 x2, mul3은 x3 in GF(2^8)
-            """
+        # 3) MixColumns 계수 블록 Bi'
+        def apply_mix(spec):
             terms = []
             for rot_key, mul_fn in spec:
                 c = rts[rot_key]
                 if mul_fn == 'mul1':
-                    terms.append(c)  # identity
+                    terms.append(c)
                 else:
-                    terms.append(getattr(self.gf_svc, mul_fn)(c))  # x2, x3
-            # XOR 합산
+                    # mul2, mul3 는 ciphertext를 (ct_hi, ct_lo) 로 리턴한다
+                    ct_hi2, ct_lo2 = getattr(self.gf_svc, mul_fn)(c)
+                    # homomorphic recombine
+                    term_ct = self.xor_svc.recombine_nibbles(ct_hi2, ct_lo2)
+                    terms.append(term_ct)
+
             acc = terms[0]
             for t in terms[1:]:
                 acc = self.xor_svc.xor_cipher(acc, t)
@@ -66,6 +68,11 @@ class AESFHETransformer:
         B3p = apply_mix([('A11', 'mul2'),
                          ('A1', 'mul3'),
                          ('A6', 'mul1')])
+
+        B0p = eng.bootstrap(B0p)
+        B1p = eng.bootstrap(B1p)
+        B2p = eng.bootstrap(B2p)
+        B3p = eng.bootstrap(B3p)
 
         # 5) 네 블록 최종 합체 (ShiftRows로 다시 rotate + XOR)
         out = B0p

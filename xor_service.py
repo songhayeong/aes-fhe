@@ -21,18 +21,12 @@ class XORConfig:
     def __init__(
             self,
             coeffs_path: Path = Path(__file__).parent / "generator" / "coeffs" / "xor_mono_coeffs.json",
-            nibble_hi_path: Path = Path(__file__).parent / "nibble_hi_coeffs.json",
-            nibble_lo_path: Path = Path(__file__).parent / "nibble_lo_coeffs.json",
-            mul_coeffs_path: Path = Path(__file__).with_name("xor_256x256_coeffs.json"),
             max_level: int = 33,
             mode: str = "parallel",
             thread_count: int = 8,
             device_id: int = 0,
     ):
         self.coeffs_path = coeffs_path
-        self.mul_path = mul_coeffs_path
-        self.nibble_hi_path = nibble_hi_path
-        self.nibble_lo_path = nibble_lo_path
         self.max_level = max_level
         self.mode = mode
         self.thread_count = thread_count
@@ -46,7 +40,7 @@ class EngineWrapper:
 
     def __init__(self, config: XORConfig):
         ctx = EngineContext(
-            signature=2,
+            signature=1,
             use_bootstrap=True,
             max_level=config.max_level,
             mode=config.mode,
@@ -133,6 +127,7 @@ class EngineWrapper:
             self.conj_key,
             self.boot_key
         )
+
 
 class ZetaEncoder:
     """
@@ -235,15 +230,10 @@ class XORService:
     """
 
     def __init__(self, engine_wrapper: EngineWrapper,
-                 coeff_cache: CoefficientCache,
-                 nibble_hi_path: CoefficientCache,
-                 nibble_lo_path: CoefficientCache,
-                 full_xor_cache: FullXORCache):
+                 coeff_cache: CoefficientCache,):
         self.eng_wrap = engine_wrapper
         self.coeff_cache = coeff_cache
-        self.nibble_hi_cache = nibble_hi_path
-        self.nibble_lo_cache = nibble_lo_path
-        self.full_xor_cache = full_xor_cache
+
 
     @property
     def eng(self) -> EngineWrapper:
@@ -263,8 +253,28 @@ class XORService:
             basis[16 - k] = eng.conjugate(pos[k - 1])
         return basis
 
+    def recombine_nibbles(self, hi_ct, lo_ct):
+        """
+        호모모픽 상태에서 hi_nibble, lo_nibble 을 하나의 byte로 재조합:
+          byte = hi_nibble * 16 + lo_nibble
+        Parameters:
+          hi_ct: Ciphertext encrypting ζ^{hi_nibble} (values 0–15)
+          lo_ct: Ciphertext encrypting ζ^{lo_nibble} (values 0–15)
+        Returns:
+          Ciphertext encrypting ζ^{(hi_nibble<<4 | lo_nibble)} (values 0–255)
+        """
+        # hi_nibble × 16
+        hi_times16_ct = self.eng_wrap.make_power_basis(hi_ct, 16)[15]
+        # 곱하기(lo) 하면 ζ^(hi*16 + lo) 이므로 재조합 완료
+        return self.eng_wrap.multiply(hi_times16_ct, lo_ct)
+
     def xor_cipher(self, enc_a, enc_b):
         eng = self.eng_wrap
+
+        if enc_a.level < 8:
+            enc_a = self.eng_wrap.bootstrap(enc_a)
+        if enc_b.level < 8:
+            enc_b = self.eng_wrap.bootstrap(enc_b)
         bx = self._build_power_basis(enc_a)
         by = self._build_power_basis(enc_b)
         pts = self.coeff_cache.get_plaintext_coeffs(eng) # 상위 하위 니블을 쪼개는데 왜 여기서는 같은 coeff만 ?

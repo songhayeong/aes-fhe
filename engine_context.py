@@ -69,7 +69,6 @@ class EngineContext:
             for delta in delta_list:
                 self.fixed_rotation_key_list.append(self.engine.create_fixed_rotation_key(self.secret_key, delta))
 
-        # Some applications may not need small bootstrap; keep optional
         self.small_bootstrap_key = self.engine.create_small_bootstrap_key(self.secret_key)
         self.bootstrap_key = self.engine.create_bootstrap_key(self.secret_key)
 
