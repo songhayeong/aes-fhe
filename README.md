@@ -1,79 +1,43 @@
-# aes-fh
-AES XOR FHE Library
+# aes-fhe
+AES FHE Library
 
-This repository implements homomorphic AES operations using zeta-domain encoding and polynomial LUT approximations in CKKS.
+# AES-XOR-FHE
 
-Overview
+Homomorphic evaluation of AES round functions (AddRoundKey, SubBytes, ShiftRows, MixColumns) over the CKKS scheme, using Zeta-domain encoding and lightweight LUT‐based GF(2⁸) multipliers.
 
-We built a complete pipeline for evaluating AES rounds on encrypted data, including:
-	1.	Zeta-domain Encoding
-	•	Map integers (0–255) into roots of unity: ζ₂₅₆ = exp(-2πi·x/256).
-	•	Maintain ciphertexts in the zeta domain for SIMD operations.
-	2.	Nibble Splitting
-	•	Split each byte into high and low 4-bit nibbles:
+---
 
-hi = byte >> 4
-lo = byte & 0xF
+## Table of Contents
 
+- [Overview](#overview)  
+- [Key Concepts](#key-concepts)  
+- [Pipeline](#pipeline)  
+- [Code Structure](#code-structure)  
+- [Usage Example](#usage-example)  
+- [Performance & Levels](#performance--levels)  
+- [Future Work](#future-work)  
 
-	•	Encrypt ζ₁₆^hi and ζ₁₆^lo separately.
+---
 
-	3.	1D LUT Polynomial Approximation
-	•	Generate IFFT-based coefficients for any 8→8 and 4→8 LUT by:
+## Overview
 
-def compute_lut_coeffs(f, n):
-    zeta_n = exp(-2πi/n)
-    lut = [zeta_n**f(x) for x in range(n)]
-    return np.fft.ifft(lut)
+This project implements **a full AES round** under CKKS homomorphic encryption by:
 
+1. **Zeta-domain encoding** of bytes into complex “ζ” values  
+2. **Nibble splitting** (high/low 4 bits) so that GF(2⁸) operations reduce to small‐domain LUTs  
+3. **Polynomial evaluation** of 4→8 LUTs for GF×2, GF×3, etc. via precomputed coefficient JSONs  
+4. **SIMD batching**: packing 2 K AES blocks per ciphertext  
+5. **Merged ShiftRows+MixColumns** via only a handful of rotates, masks, and XORs  
 
-	•	Saved coefficients for GF multipliers (×2, ×3, ×9, ×11, ×13, ×14) and AES S-Box hi/lo.
+---
 
-	4.	GF(2⁸) Multipliers via 2-var Polynomials
-	•	Implemented gf_mult_k(context, ct_hi, ct_lo) using sparse polynomial LUTs on (hi, lo) pairs.
-	•	Avoid explicit bitwise extract by evaluating two small LUTs and combining.
-	5.	ShiftRows + MixColumns Merger
-	•	Precompute four rotated ciphertexts corresponding to AES ShiftRows shifts.
-	•	Compute four SIMD blocks B0'..B3' by combining GF multipliers on rotated inputs.
-	•	Final assemble: rotate back and XOR-merge to produce combined ShiftRows+MixColumns in one pass.
-	6.	AddRoundKey Extension
-	•	Homomorphic XOR-add round key by zeta-domain subtraction and addition.
-	7.	Testing & Validation
-	•	Unit tests comparing FHE outputs against pure-Python AES implementations.
-	•	Debugged level counts and inserted bootstrapping where needed.
+## Key Concepts
 
-Directory Structure
+- **Zeta Encoding**  
+  Map each 0–15 nibble `x` to  
+  ```python
+  ζ₁₆^x = exp(-2j * π * x / 16)
 
-aes_xor_fhe/
-├── xor_service.py      # Zeta encode/decode, nibble split, XOR, AddRoundKey
-├── gf_service.py       # GF multiplier wrappers (×2, ×3, …) via 2-var polynomials
-├── mixcolumns_service.py  # Merged ShiftRows+MixColumns implementation
-├── sbox_service.py     # AES S-Box via two 8→4 LUTs
-├── generator/coeffs/    # Generated JSON coefficient files for LUTs
-├── tests/               # pytest test suite for each component
-└── README.md            # This document
-
-Usage
-
-from aes_xor_fhe import EngineWrapper, XORService, GFService, AESFHETransformer
-
-# 1. Initialize FHE engine & services
-generator = EngineWrapper(config)
-xor_svc = XORService(generator)
-gf_svc = GFService(generator, xor_svc)
-transformer = AESFHETransformer(generator, xor_svc, gf_svc)
-
-# 2. Encrypt and evaluate one AES round
-state = np.random.randint(0, 256, size=16, dtype=np.uint8)
-ct = transformer.merged_shift_mix(state)
-
-# 3. Decrypt & decode
-dec = generator.decrypt(ct)
-out = XORService.from_zeta(dec, modulus=256)[:16]
-
-Acknowledgments
-	•	Based on polynomial LUT techniques for FHE-friendly AES (GHS-12 sketch).
-	•	Uses DesiloFHE CKKS backend via EngineWrapper.
 
 ⸻
 
