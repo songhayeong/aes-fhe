@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-from aes_xor_fhe.new import XORService, ZetaEncoder, CoefficientCache, AddRoundKeyFHE
+from aes_xor_fhe.new import XORService, ZetaEncoder, CoefficientCache, AESFHERound
 
 
 @pytest.fixture
@@ -18,7 +18,7 @@ def ark_svc():
     )
     eng_wrap = EngineWrapper(config)
     xor = XORService(eng_wrap, coeff_cache=CoefficientCache(config.coeffs_path))
-    return AddRoundKeyFHE(eng_wrap, xor)
+    return AESFHERound(eng_wrap, xor)
 
 
 def test_add_round_key_simd(ark_svc):
@@ -32,7 +32,7 @@ def test_add_round_key_simd(ark_svc):
 
     # 3) Decrypt and decode, then trim to original length
     dec = ark_svc.eng.decrypt(ct_full)
-    decoded = ZetaEncoder.from_zeta(dec, modulus=256슬)[:size].astype(np.uint8)
+    decoded = ZetaEncoder.from_zeta(dec, modulus=256)[:size].astype(np.uint8)
 
     # 4) Compare with numpy XOR
     expected = (state ^ key).astype(np.uint8)

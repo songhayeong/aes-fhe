@@ -10,7 +10,7 @@ from typing import Dict, Tuple, Any
 
 import numpy as np
 from desilofhe import Engine
-from aes_xor_fhe.engine_context import EngineContext
+from engine_context import EngineContext
 
 
 class XORConfig:

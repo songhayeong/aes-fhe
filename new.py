@@ -1,9 +1,9 @@
 import numpy as np
 from typing import Tuple, Any
 
-from aes_xor_fhe.engine_context import EngineContext
-from aes_xor_fhe.xor_service import EngineWrapper, XORService, ZetaEncoder, CoefficientCache
-
+from engine_context import EngineContext
+from xor_service import EngineWrapper, XORService, ZetaEncoder, CoefficientCache
+from desilofhe import Ciphertext
 
 def _get_shift_rows_masks(ctx: EngineContext) -> dict[int, Any]:
     """
@@ -194,8 +194,8 @@ class AESFHERound:
         :param key:   uint8 array shape (N,)
         :param recombine: True 이면 복호화+재조합 결과(byte array) 반환
                           False 이면 (ct_hi, ct_lo) 반환
+
         """
-        # 1) 니블 분해
         s_hi, s_lo = split_nibbles(state)
         k_hi, k_lo = split_nibbles(key)
 
